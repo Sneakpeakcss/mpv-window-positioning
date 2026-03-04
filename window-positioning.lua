@@ -43,7 +43,6 @@ ffi.cdef[[
     BOOL     SetWindowPos(HWND hWnd, HWND hWndInsertAfter, int X, int Y, int cx, int cy, UINT uFlags);
     BOOL     SetWindowPlacement(HWND hWnd, const WINDOWPLACEMENT* lpwndpl);
     HMONITOR MonitorFromPoint(POINT pt, DWORD dwFlags);
-    HWND     GetConsoleWindow(void);
     HRESULT  GetDpiForMonitor(HMONITOR hMonitor, UINT dpiType, UINT* dpiX, UINT* dpiY);
     UINT     GetDpiForWindow(HWND hwnd);
     int      GetSystemMetricsForDpi(int nIndex, UINT dpi);
@@ -311,16 +310,12 @@ local function move_window(hwnd, x, y, w, h)
     -- Handle restore when mpv starts minimized/maximized/fullscreen
     if defer_restore then
         if not state.is_fullscreen then
-            local t = defer_restore == "--fullscreen" and (console and 0.05 or 0.02) or 0.2
-            mp.add_timeout(t, function()
-                apply_restore_rect(
-                    adj_x, adj_y,
-                    win_w, win_h,
-                    state, border,
-                    target_dpi, dpi_changed
-                )
-                defer_restore = false
-            end)
+            apply_restore_rect(
+                adj_x, adj_y,
+                win_w, win_h,
+                state, border,
+                target_dpi, dpi_changed
+            )
         end
         return "deferred"
     end
@@ -366,18 +361,7 @@ local function window_ready_check(_, value)
     end
     if mpv_hwnd then
         opening_dpi = ffi.C.GetDpiForWindow(mpv_hwnd)
-        console = ffi.C.GetConsoleWindow() ~= nil
-        if sx and sy and not skip_restore then
-            if not (defer_restore or moved) then
-                mp.set_property("geometry", "")
-            end
-            if not moved then
-                moved = move_window(mpv_hwnd, sx, sy, sw, sh)
-            end
-            return
-        end
-    end
-    if not skip_restore and not defer_restore then
+    else
         mp.set_property("geometry", "50%:50%")
         mp.msg.warn("Could not restore position.")
     end
@@ -422,6 +406,20 @@ local function initialize()
     mp.enable_messages("v")
     mp.register_event("log-message", function(event)
         if event.prefix:match("^vo/.+/win32$") and event.text then
+            if not moved then
+                -- Restore when mpv’s first resize signals the window is ready, avoiding arbitrary timers.
+                local mpv_trigger = event.text:match("^resize window:%s*%d+:%d+")
+                local fs = mp.get_property_native("fullscreen")
+                if mpv_hwnd and mpv_trigger and sx and not (fs or skip_restore) then
+                    if not defer_restore then
+                        mp.set_property("geometry", "")
+                    end
+                    moved = move_window(mpv_hwnd, sx, sy, sw, sh)
+                    if moved == "deferred" then
+                        defer_restore = false
+                    end
+                end
+            end
             local x, y, w, h = event.text:match("save window bounds:%s*(-?%d+):(-?%d+):(%d+):(%d+)")
             if x and y and w and h then
                 saved_bounds = {
@@ -432,17 +430,6 @@ local function initialize()
             end
         end
     end)
-    -- Wait for fullscreen exit before setting 'SetWindowPlacement' to avoid broken window state.
-    if defer_restore == "--fullscreen" then
-        local function fullscreen_exit(_, value)
-            if defer_restore and suppress_init and not value then
-                move_window(mpv_hwnd, sx, sy, sw, sh)
-                mp.unobserve_property(fullscreen_exit)
-            end
-            suppress_init = true
-        end
-        mp.observe_property("fullscreen", "bool", fullscreen_exit)
-    end
 end
 
 local r = mp.get_property_native("screen") ~= "default" and "--screen"
