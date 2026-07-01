@@ -43,7 +43,6 @@ ffi.cdef[[
     BOOL     SetWindowPos(HWND hWnd, HWND hWndInsertAfter, int X, int Y, int cx, int cy, UINT uFlags);
     BOOL     SetWindowPlacement(HWND hWnd, const WINDOWPLACEMENT* lpwndpl);
     HMONITOR MonitorFromPoint(POINT pt, DWORD dwFlags);
-    HWND     GetConsoleWindow(void);
     HRESULT  GetDpiForMonitor(HMONITOR hMonitor, UINT dpiType, UINT* dpiX, UINT* dpiY);
     UINT     GetDpiForWindow(HWND hwnd);
     int      GetSystemMetricsForDpi(int nIndex, UINT dpi);
@@ -56,8 +55,13 @@ local SM_CXPADDEDBORDER = 92                    -- The amount of border padding 
 local SM_CYCAPTION      = 4                     -- The height of a caption area, in pixels
 local SM_CXBORDER       = 5                     -- Standard window border width (1px)
 local SM_CXFRAME        = 32                    -- Width of the resize frame
+local SW_SHOWNORMAL     = 1                     -- Activates and displays a window in its original size and position
+local SW_SHOWMINIMIZED  = 2                     -- Activates the window and displays it as a minimized window
+local SW_SHOWMAXIMIZED  = 3                     -- Activates the window and displays it as a maximized window
+local SW_RESTORE        = 9                     -- Restores and shows the window if minimized or maximized
 local SWP_NOSIZE        = 0x0001                -- Retains the current size (ignores the cx and cy parameters)
-local SWP_NOZORDER      = 0x0004                -- Retains the current Z order (ignores the hwndInsertAfter).
+local SWP_NOMOVE        = 0x0002                -- Retains the current position (ignores X and Y parameters)
+local SWP_NOZORDER      = 0x0004                -- Retains the current Z order (ignores the hwndInsertAfter)
 local SWP_SHOWWINDOW    = 0x0040                -- Show the window if hidden
 local HWND_TOP          = ffi.cast("HWND", 0)   -- Place the window at the top of the Z-order (ignored by SWP_NOZORDER)
 
@@ -71,6 +75,22 @@ local function get_full_window_size(hwnd)
         y = rect.top,
         width  = rect.right - rect.left,
         height = rect.bottom - rect.top
+    }
+end
+
+local function get_restore_rect(hwnd)
+    local wp = ffi.new("WINDOWPLACEMENT")
+    ffi.fill(wp, ffi.sizeof(wp))
+    wp.length = ffi.sizeof(wp)
+    ffi.C.GetWindowPlacement(hwnd, wp)
+    local r = wp.rcNormalPosition
+    return {
+        x = r.left,
+        y = r.top,
+        width   = r.right - r.left,
+        height  = r.bottom - r.top,
+        showCmd = wp.showCmd,
+        flags   = wp.flags
     }
 end
 
@@ -167,24 +187,39 @@ local function clamp_window_to_workarea(x, y, w, h, state, border)
     return x, y
 end
 
-local function apply_restore_rect(x, y, w, h, state, border, target_dpi, dpi_changed)
+local function apply_restore_rect(x, y, w, h, state, border)
     local wp = ffi.new("WINDOWPLACEMENT")
     ffi.fill(wp, ffi.sizeof(wp))
     wp.length = ffi.sizeof(wp)
     if ffi.C.GetWindowPlacement(mpv_hwnd, wp) ~= 0 then
         local r = wp.rcNormalPosition
-        local width  = (o.restore_window_size and not dpi_changed and w) or (r.right  - r.left)
-        local height = (o.restore_window_size and not dpi_changed and h) or (r.bottom - r.top)
-        if dpi_changed then
-            local dpi_ratio = state.current_dpi / target_dpi
-            width, height   = scale_round(width, dpi_ratio), scale_round(height, dpi_ratio)
-        end
+        local width  = w or (r.right  - r.left)
+        local height = h or (r.bottom - r.top)
         local adj_x, adj_y = clamp_window_to_workarea(x, y, width, height, state, border)
         r.left   = adj_x
         r.top    = adj_y
         r.right  = adj_x + width
         r.bottom = adj_y + height
+        local init_showCmd =
+             (istate.is_fullscreen and 
+              istate.is_maximized  and SW_SHOWMAXIMIZED) or  -- mpv's handling of max+fs is broken atm
+             (istate.is_fullscreen and 
+              istate.is_minimized  and SW_SHOWNORMAL)    or
+             (istate.is_minimized  and SW_SHOWMINIMIZED) or
+             (istate.is_maximized  and SW_SHOWMAXIMIZED) or
+             SW_SHOWNORMAL
+        -- Temporarily remove borders to avoid flicker
+        local hide_border = state.has_border and istate.is_minimized and not istate.is_fullscreen
+        if hide_border then mp.set_property_bool("border", false) end
+        -- Restore before moving to avoiding broken states,
+        -- min state doesn't require restore, also bugs out when launched with min+max
+        if not (istate.is_minimized and istate.is_maximized) or istate.is_fullscreen then
+            wp.showCmd = SW_RESTORE
+            ffi.C.SetWindowPlacement(mpv_hwnd, wp)
+        end
+        wp.showCmd = init_showCmd
         ffi.C.SetWindowPlacement(mpv_hwnd, wp)
+        if hide_border then mp.set_property_bool("border", true) end
     end
 end
 
@@ -239,23 +274,14 @@ local function cache_geometry(name, value)
        (is_osd    and state.is_fullscreen) or
        (is_full   and state.is_maximized)  then return end
 
-    if defer_minmax and is_minmax and not (value or left_minmax) then
-        left_minmax = true
-    end
-
-    local wp = ffi.new("WINDOWPLACEMENT")
-    ffi.fill(wp, ffi.sizeof(wp))
-    wp.length = ffi.sizeof(wp)
-    ffi.C.GetWindowPlacement(mpv_hwnd, wp)
-
     -- X/Y position
     local x_offset, y_offset = border_offset(state)
-    local pos = wp.rcNormalPosition
-    local x = pos.left + x_offset
-    local y = pos.top  + y_offset
+    local r = get_restore_rect(mpv_hwnd)
+    local x = r.x + x_offset
+    local y = r.y + y_offset
     -- Fullscreen position
     if is_full and value then
-        x, y = saved_bounds.x, saved_bounds.y
+        x, y = saved_bounds.x + x_offset, saved_bounds.y + y_offset
     end
 
     local width, height
@@ -265,11 +291,14 @@ local function cache_geometry(name, value)
     -- Width/height
     if o.restore_window_size then
         if is_minmax and value then
-            local win_w = pos.right  - pos.left
-            local win_h = pos.bottom - pos.top
+            local win_w = r.width
+            local win_h = r.height
             width, height = rect_to_normalized_client(win_w, win_h, state)
 
-        elseif (is_full or (is_osd and valid)) and osd_w > 0 and osd_h > 0 then
+        elseif is_full and value then
+            width, height = rect_to_normalized_client(saved_bounds.w, saved_bounds.h, state)
+
+        elseif (is_osd and valid) and osd_w > 0 and osd_h > 0 then
             local dpi_ratio = opening_dpi / state.current_dpi
             width  = scale_round(osd_w, dpi_ratio)
             height = scale_round(osd_h, dpi_ratio)
@@ -295,32 +324,46 @@ local function move_window(hwnd, x, y, w, h)
     local target_dpi  = get_target_monitor_dpi(center_x, center_y)
     local dpi_changed = (target_dpi ~= state.current_dpi)
     local border  = get_window_border(target_dpi)
-    local restore = o.restore_window_size and w and h and not dpi_changed
+    local restore = o.restore_window_size and w and h
 
     local win_w, win_h
     if restore then
         win_w, win_h = normalized_client_to_rect(w, h, state, border, target_dpi)
     else
         local dpi_ratio = target_dpi / state.current_dpi
-        win_w, win_h = scale_round(cur_w, dpi_ratio), scale_round(cur_h, dpi_ratio)
+        win_w, win_h = scale_round(w or cur_w, dpi_ratio), scale_round(h or cur_h, dpi_ratio)
+    end
+    -- Adjust saved position if border state changed
+    if sb ~= state.has_border then
+        local adj = sb and -1 or 1
+        x = x + adj * border.thinBorderWidth
+        y = y + adj * (border.titlebarHeight + border.borderPadding)
     end
 
     local x_offset, y_offset = border_offset(border, state.has_border)
     local adj_x, adj_y = x - x_offset, y - y_offset
-
+    -- In case autoprofile changed window state after init
+    local force_window = state.is_maximized or state.is_minimized or state.is_fullscreen
+    if (state.is_maximized  and not istate.is_maximized) or
+       (state.is_minimized  and not istate.is_minimized) or
+       (state.is_fullscreen and not istate.is_fullscreen) or
+       (force_window and not defer_restore) then
+        defer_restore = state.is_fullscreen and "--fullscreen" or true
+        istate = state
+    end
+    -- Always defer for correct(ish) sizing when DPI changes
+    if dpi_changed and restore and not defer_restore then
+        defer_restore = true
+    end
     -- Handle restore when mpv starts minimized/maximized/fullscreen
     if defer_restore then
         if not state.is_fullscreen then
-            local t = defer_restore == "--fullscreen" and (console and 0.05 or 0.02) or 0.2
-            mp.add_timeout(t, function()
-                apply_restore_rect(
-                    adj_x, adj_y,
-                    win_w, win_h,
-                    state, border,
-                    target_dpi, dpi_changed
-                )
-                defer_restore = false
-            end)
+            apply_restore_rect(
+                adj_x, adj_y,
+                win_w, win_h,
+                state, border
+            )
+            defer_restore = false
         end
         return "deferred"
     end
@@ -341,21 +384,42 @@ local function save_geometry()
         return mp.msg.error("mpv window not found.")
     end
     local x, y, w, h = get_window_geometry(mpv_hwnd)
-    if math.abs(x) > 30000 or math.abs(y) > 30000 then return end
+    if (x and math.abs(x) > 30000) or (y and math.abs(y) > 30000) then return end
     -- In case if launched in min/max/fs, but closed before restoring.
-    local use_saved = (sx and sy) and (defer_restore or (defer_minmax and not left_minmax))
-    if use_saved then
+    if sx and sy and defer_restore then
         x, y, w, h = sx, sy, sw, sh
     end
     local file = io.open(windowpos_path, "w+")
     if not file then
         return mp.msg.error("Failed to save geometry.")
     end
+    file:write(tostring(mp.get_property_bool("border")), "\n")
     file:write(x, "\n", y, "\n")
     if o.restore_window_size and h and h >= 10 then
         file:write(w, "x", h)
     end
     file:close()
+end
+
+-- Terminal/explorer/taskbar/file/no-file/force-window initialization time differs.
+-- To avoid broken window states, we wait until geometry/min/max is applied
+-- and use it as a safe early timing to move the window.
+-- Required for reliability due to timing changes caused by 'mpv-player/mpv#16127'
+local function await_ready()
+    if moved then return end
+    tick = (tick or 0) + 1
+    local rect = get_full_window_size(mpv_hwnd)
+    local restore = get_restore_rect(mpv_hwnd)
+    local offscreen = math.abs(rect.x) > 30000 or math.abs(rect.y) > 30000
+    if offscreen or restore.showCmd == SW_SHOWMAXIMIZED or tick >= 100 then
+        local pass_w = (o.restore_window_size and sw) or restore.width
+        local pass_h = (o.restore_window_size and sh) or restore.height
+        if not defer_restore then
+            mp.set_property("geometry", "")
+        end
+        timer:kill()
+        moved = move_window(mpv_hwnd, sx, sy, pass_w, pass_h)
+    end
 end
 
 local function window_ready_check(_, value)
@@ -365,19 +429,18 @@ local function window_ready_check(_, value)
         mpv_hwnd = ffi.cast("HWND", value)
     end
     if mpv_hwnd then
-        opening_dpi = ffi.C.GetDpiForWindow(mpv_hwnd)
-        console = ffi.C.GetConsoleWindow() ~= nil
-        if sx and sy and not skip_restore then
-            if not (defer_restore or moved) then
-                mp.set_property("geometry", "")
-            end
-            if not moved then
-                moved = move_window(mpv_hwnd, sx, sy, sw, sh)
-            end
-            return
+        -- geometry=1x1 clamps to ~136×39, force window size to limit the 1-frame flash.
+        if not (skip_restore or defer_restore == "--fullscreen") then
+            ffi.C.SetWindowPos(mpv_hwnd, nil, 0, 0, 0, 0, bit.bor(SWP_NOMOVE))
         end
-    end
-    if not skip_restore and not defer_restore then
+        istate = get_window_state(mpv_hwnd)
+        opening_dpi = istate.current_dpi
+        if sx and sy and not (moved or skip_restore or timer) then
+            if defer_restore ~= "--fullscreen" then
+                timer = mp.add_periodic_timer(0.01, await_ready)
+            end
+        end
+    else
         mp.set_property("geometry", "50%:50%")
         mp.msg.warn("Could not restore position.")
     end
@@ -388,6 +451,7 @@ local function initialize()
     if not skip_restore then
         local file = io.open(windowpos_path, "r")
         if file then
+            sb = (file:read("*l") == "true")
             sx = tonumber(file:read("*l"))
             sy = tonumber(file:read("*l"))
             if o.restore_window_size then
@@ -401,7 +465,8 @@ local function initialize()
             if sx and sy and not defer_restore then
                 -- Set offscreen geometry to prevent startup centering
                 -- and reduce flicker before window-id is ready.
-                mp.set_property("geometry", "+-32000+32000")
+                -- Forcing size partially limits a 1-frame white flash in client regions outside the screen bounds.
+                mp.set_property("geometry", "1x1+-32000+32000")
             end
         end
     end
@@ -418,31 +483,37 @@ local function initialize()
     -- Very hacky way of getting reliable window position before mpv enters fullscreen.
     -- rcNormalPosition returns fullscreen dimensions on the very first fullscreen toggle,
     -- so observing fullscreen isn’t enough to get the correct windowed geometry.
-    -- The required data is available in verbose messages, but it can’t be accessed in any sane way.
     mp.enable_messages("v")
     mp.register_event("log-message", function(event)
-        if event.prefix:match("^vo/.+/win32$") and event.text then
-            local x, y, w, h = event.text:match("save window bounds:%s*(-?%d+):(-?%d+):(%d+):(%d+)")
-            if x and y and w and h then
+        if event.prefix == "cplayer" and (
+           event.text:find("Set property: fullscreen", 1, true) or 
+           event.text:find("Setting option 'fullscreen' = 'yes'", 1, true) -- Autoprofile
+        ) then
+            local rect = get_full_window_size(mpv_hwnd)
+            if rect then
                 saved_bounds = {
-                    x = tonumber(x), y = tonumber(y),
-                    w = tonumber(w), h = tonumber(h)
+                    x = rect.x, y = rect.y,
+                    w = rect.width, h = rect.height,
                 }
-                cache_geometry("fullscreen", mp.get_property_native("fullscreen"))
+                cache_geometry("fullscreen", mp.get_property_bool("fullscreen"))
             end
         end
     end)
     -- Wait for fullscreen exit before setting 'SetWindowPlacement' to avoid broken window state.
-    if defer_restore == "--fullscreen" then
-        local function fullscreen_exit(_, value)
-            if defer_restore and suppress_init and not value then
-                move_window(mpv_hwnd, sx, sy, sw, sh)
+    local function fullscreen_exit(_, value)
+        if suppress_init then
+            if defer_restore == "--fullscreen" and not value then
+                mp.add_timeout(0.05, function()
+                    moved = move_window(mpv_hwnd, sx, sy, sw, sh)
+                    mp.unobserve_property(fullscreen_exit)
+                end)
+            elseif not defer_restore and moved then
                 mp.unobserve_property(fullscreen_exit)
             end
-            suppress_init = true
         end
-        mp.observe_property("fullscreen", "bool", fullscreen_exit)
+        suppress_init = true
     end
+    mp.observe_property("fullscreen", "bool", fullscreen_exit)
 end
 
 local r = mp.get_property_native("screen") ~= "default" and "--screen"
@@ -456,7 +527,6 @@ if r then
         skip_restore = true
         mp.msg.warn("mpv launched with " .. r .. ", skipping restore.")
     else
-        defer_minmax  = r == "--window-maximized" or r == "--window-minimized"
         defer_restore = r
     end
 end
