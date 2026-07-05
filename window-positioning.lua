@@ -429,7 +429,8 @@ local function window_ready_check(_, value)
         mpv_hwnd = ffi.cast("HWND", value)
     end
     if mpv_hwnd then
-        -- geometry=1x1 clamps to ~136×39, force window size to limit the 1-frame flash.
+        -- Shrink window to avoid a 1-frame white flash from any client area outside screen bounds
+        -- We use this over geometry=1x1 because it clamps to ~136x39 and breaks opening animation
         if not (skip_restore or defer_restore == "--fullscreen") then
             ffi.C.SetWindowPos(mpv_hwnd, nil, 0, 0, 0, 0, bit.bor(SWP_NOMOVE))
         end
@@ -465,8 +466,7 @@ local function initialize()
             if sx and sy and not defer_restore then
                 -- Set offscreen geometry to prevent startup centering
                 -- and reduce flicker before window-id is ready.
-                -- Forcing size partially limits a 1-frame white flash in client regions outside the screen bounds.
-                mp.set_property("geometry", "1x1+-32000+32000")
+                mp.set_property("geometry", "+-32000+32000")
             end
         end
     end
@@ -486,8 +486,8 @@ local function initialize()
     mp.enable_messages("v")
     mp.register_event("log-message", function(event)
         if event.prefix == "cplayer" and (
-           event.text:find("Set property: fullscreen", 1, true) or 
-           event.text:find("Setting option 'fullscreen' = 'yes'", 1, true) -- Autoprofile
+           event.text:sub(1, 24) == "Set property: fullscreen" or
+           event.text:sub(1, 35) == "Setting option 'fullscreen' = 'yes'" -- Autoprofile
         ) then
             local rect = get_full_window_size(mpv_hwnd)
             if rect then
